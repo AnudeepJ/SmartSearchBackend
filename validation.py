@@ -53,8 +53,9 @@ def validate_llm_response(params: Dict[str, Any], metadata_fields: Dict[str, Any
         field_metadata = searchable_fields[field_name]
         print(f"Found field metadata: {field_metadata}")
         
-        # Handle date fields
-        if field_metadata.get("dataType") == "date":
+        # Handle date fields (case-insensitive)
+        data_type = field_metadata.get("dataType", "").lower()
+        if data_type == "date":
             if not is_valid_date(value):
                 invalid_values[field_name] = value
                 continue
@@ -68,17 +69,16 @@ def validate_llm_response(params: Dict[str, Any], metadata_fields: Dict[str, Any
                 invalid_values[field_name] = value
                 continue
                 
-        # Handle boolean fields
-        elif field_metadata.get("dataType") == "boolean":
-            if not isinstance(value, bool):
+        # Handle boolean fields (case-insensitive)
+        elif data_type == "boolean":
+            if not isinstance(value, bool) and not normalize_boolean_for_validation(value):
                 invalid_values[field_name] = value
                 continue
                 
-        # Handle string fields
-        elif field_metadata.get("dataType") == "string":
-            if not isinstance(value, str):
-                invalid_values[field_name] = value
-                continue
+        # Handle string fields (case-insensitive)
+        elif data_type == "string":
+            # Accept any value that can be converted to string
+            pass
                 
         # If validation passes, add to cleaned output
         cleaned_output[field_name] = value
@@ -108,21 +108,36 @@ def is_valid_date(value: Any) -> bool:
     except ValueError:
         return False
 
+def normalize_boolean_for_validation(value: Any) -> bool:
+    """Check if a value can be normalized to boolean for validation purposes."""
+    if isinstance(value, bool):
+        return True
+        
+    if isinstance(value, str):
+        value = value.lower().strip()
+        if value in ["true", "yes", "1", "y", "false", "no", "0", "n"]:
+            return True
+            
+    return False
+
 def is_valid_select_value(value: Any, select_values: List[str]) -> bool:
     """Check if a value is valid for a select field."""
     if not select_values:
         return True
         
-    # Handle both single string values and lists of values
-    if isinstance(value, list):
-        # For lists, check if all values are valid
-        return all(
-            any(v.lower() == allowed_value.lower() for allowed_value in select_values)
-            for v in value
-        )
+    # Handle comma-separated strings from LLM
+    if isinstance(value, str) and "," in value:
+        values_to_check = [v.strip() for v in value.split(",")]
+    elif isinstance(value, list):
+        values_to_check = value
     else:
-        # For single values, check if it matches any allowed value
-        return any(value.lower() == allowed_value.lower() for allowed_value in select_values)
+        values_to_check = [str(value)]
+    
+    # Check if all values are valid (case-insensitive)
+    return all(
+        any(v.lower() == allowed_value.lower() for allowed_value in select_values)
+        for v in values_to_check
+    )
 
 def print_validation_details(validation_result: Dict[str, Any]) -> None:
     """Print detailed validation information."""
@@ -142,25 +157,6 @@ def print_validation_details(validation_result: Dict[str, Any]) -> None:
     print("\nCleaned Output:")
     print(json.dumps(validation_result["cleaned_output"], indent=2))
 
-def get_field_metadata(field_name: str, metadata_fields: Dict[str, Any]) -> Dict[str, Any]:
-    """Get metadata for a specific field."""
-    for field in metadata_fields.get("searchSchema", {}).get("fields", []):
-        if field["identifier"] == field_name:
-            return field
-    return {}
 
-def find_similar_fields(field_name: str, metadata_fields: Dict[str, Any], threshold: int = 80) -> List[Tuple[str, int]]:
-    """Find fields similar to the given field name."""
-    searchable_fields = [
-        field["identifier"] 
-        for field in metadata_fields.get("searchSchema", {}).get("fields", [])
-        if field.get("searchable", False)
-    ]
-    
-    return process.extract(field_name, searchable_fields, scorer=fuzz.ratio, limit=3)
-
-def find_closest_valid_values(value: str, allowed_values: List[str], threshold: int = 80) -> List[Tuple[str, int]]:
-    """Find the closest valid values for a given input."""
-    return process.extract(value, allowed_values, scorer=fuzz.ratio, limit=3)
 
 

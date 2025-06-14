@@ -18,11 +18,17 @@ def normalize_fields(params: Dict[str, Any], metadata_fields: Dict[str, Any], ve
     normalized_params = {}
     
     # Get searchable fields from metadata
-    searchable_fields = {
-        field["identifier"]: field 
-        for field in metadata_fields.get("searchSchema", {}).get("fields", [])
-        if field.get("searchable", False)
-    }
+    searchable_fields = {}
+    
+    # Process single value fields
+    for field in metadata_fields.get("searchSchema", {}).get("singleValueFields", []):
+        if field.get("searchable", False):
+            searchable_fields[field["identifier"]] = field
+    
+    # Process multi value fields
+    for field in metadata_fields.get("searchSchema", {}).get("multiValueFields", []):
+        if field.get("searchable", False):
+            searchable_fields[field["identifier"]] = field
     
     # Normalize each parameter
     for field_name, value in params.items():
@@ -67,20 +73,23 @@ def normalize_value(value: Any, field_metadata: Dict[str, Any]) -> Any:
     if isinstance(value, list):
         return [normalize_value(v, field_metadata) for v in value]
         
-    # Handle date fields
-    if field_metadata.get("dataType") == "date":
+    # Handle date fields (case-insensitive)
+    data_type = field_metadata.get("dataType", "").lower()
+    if data_type == "date":
         return normalize_date(value)
         
     # Handle select fields
     if field_metadata.get("selectValues"):
-        return normalize_select_value(value, field_metadata["selectValues"])
+        # Extract the actual values from the selectValues structure
+        allowed_values = [v["value"] if isinstance(v, dict) else v for v in field_metadata["selectValues"]]
+        return normalize_select_value(value, allowed_values)
         
-    # Handle boolean fields
-    if field_metadata.get("dataType") == "boolean":
+    # Handle boolean fields (case-insensitive)
+    if data_type == "boolean":
         return normalize_boolean(value)
         
-    # Handle string fields
-    if field_metadata.get("dataType") == "string":
+    # Handle string fields (case-insensitive)
+    if data_type == "string":
         return str(value).strip()
         
     return value
@@ -111,14 +120,34 @@ def normalize_date(value: Any) -> str:
                 
     return None
 
-def normalize_select_value(value: str, allowed_values: List[str]) -> str:
+def normalize_select_value(value: Any, allowed_values: List[str]) -> str:
     """Normalize a select value to match allowed values."""
+    # Handle comma-separated values from LLM
+    if isinstance(value, str) and "," in value:
+        values_to_normalize = [v.strip() for v in value.split(",")]
+        normalized_values = []
+        
+        for val in values_to_normalize:
+            # Direct match
+            if val in allowed_values:
+                normalized_values.append(val)
+            else:
+                # Try to find similar value
+                matches = process.extract(val, allowed_values, limit=1)
+                if matches and matches[0][1] >= 90:  # High similarity threshold
+                    normalized_values.append(matches[0][0])
+        
+        return ",".join(normalized_values) if normalized_values else None
+    
+    # Handle single values
+    value_str = str(value)
+    
     # Direct match
-    if value in allowed_values:
-        return value
+    if value_str in allowed_values:
+        return value_str
         
     # Try to find similar value
-    matches = process.extract(value, allowed_values, limit=1)
+    matches = process.extract(value_str, allowed_values, limit=1)
     if matches and matches[0][1] >= 90:  # High similarity threshold
         return matches[0][0]
         

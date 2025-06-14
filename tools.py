@@ -115,10 +115,42 @@ def transform_search_response(search_results: Dict[str, Any], search_params: Dic
         "filters": filters  # List of filters with current selections and all possible values
     }
 
+def convert_ids_to_display_values(ids: List[str], field_metadata: Dict[str, Any]) -> List[Dict[str, str]]:
+    """
+    Convert ID values back to display values with both ID and text.
+    
+    Args:
+        ids: List of ID values to convert
+        field_metadata: Field metadata containing selectValues
+        
+    Returns:
+        List of objects with 'id' and 'display' keys
+    """
+    result = []
+    for id_value in ids:
+        # Try to find the display value for this ID
+        display_value = None
+        for select_value in field_metadata.get("selectValues", []):
+            if str(select_value.get("id", "")) == str(id_value):
+                display_value = select_value.get("value", id_value)
+                break
+        
+        # If no display value found, use the ID as display
+        if display_value is None:
+            display_value = id_value
+            
+        result.append({
+            "id": id_value,
+            "display": display_value
+        })
+    
+    return result
+
 def prepare_filters_for_ui(search_params: Dict[str, Any], metadata: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     Prepare filter objects for UI before API call.
     This ensures we have the correct field names and metadata before any transformations.
+    Includes both ID values and human-readable display values.
     """
     print("\n=== Debug: Preparing Filters for UI ===")
     print("Search params:", {k: v for k, v in search_params.items() if k not in ["returnFields", "userId", "orgId"]})
@@ -152,12 +184,17 @@ def prepare_filters_for_ui(search_params: Dict[str, Any], metadata: Dict[str, An
             else:
                 current_values = [str(values)]
             
+            # Convert IDs to display values with both ID and text
+            applied_values = convert_ids_to_display_values(current_values, field_metadata)
+            
             # Create filter object with:
-            # 1. Current selections (applied_filters)
+            # 1. Current selections with both IDs and display values (applied_filters)
             # 2. Complete field metadata including all possible values (filter)
             filter_obj = {
                 "applied_filters": {
-                    field_name: current_values  # Use original field name for UI
+                    field_name: [val["id"] for val in applied_values],  # Original ID array for compatibility
+                    f"{field_name}_display": [val["display"] for val in applied_values],  # Human-readable values
+                    f"{field_name}_full": applied_values  # Full objects with both id and display
                 },
                 "filter": {
                     "fieldName": field_metadata.get("fieldName"),
@@ -172,43 +209,15 @@ def prepare_filters_for_ui(search_params: Dict[str, Any], metadata: Dict[str, An
             }
             filters.append(filter_obj)
             print(f"Added filter for {field_name}")
+            print(f"  - IDs: {[val['id'] for val in applied_values]}")
+            print(f"  - Display: {[val['display'] for val in applied_values]}")
         else:
             print(f"No metadata found for {field_name}")
     
     print(f"\nTotal filters prepared: {len(filters)}")
     return filters
 
-def get_modified_identifier(field_name: str) -> str:
-    """
-    Map metadata field identifiers to search API field names.
-    Returns the original field name if no mapping exists.
-    """
-    field_mapping = {
-        "vendordocumentnumber": "vendorDocumentNumber",
-        "vendorrev": "vendorRev",
-        "contractordocumentnumber": "contractorDocumentNumber",
-        "contractorrev": "contractorRev",
-        "packagenumber": "packageNumberValues",
-        "contractnumber": "contractNumberValues",
-        "statusid": "docstatus",  # Map statusid to docstatus
-        "vdrcode": "vdrCodeValues",
-        "category": "categoryValues",
-        "attribute1": "attribute1Values",
-        "attribute2": "attribute2Values",
-        "attribute3": "attribute3Values",
-        "attribute4": "attribute4Values",
-        "selectList1": "selectList1Values",
-        "selectList2": "selectList2Values",
-        "selectList3": "selectList3Values",
-        "selectList4": "selectList4Values",
-        "selectList5": "selectList5Values",
-        "selectList6": "selectList6Values",
-        "selectList7": "selectList7Values",
-        "selectList8": "selectList8Values",
-        "selectList9": "selectList9Values",
-        "selectList10": "selectList10Values"
-    }
-    return field_mapping.get(field_name, field_name)
+
 
 def get_original_identifier(field_name: str) -> str:
     """
@@ -303,100 +312,7 @@ def call_search_api(params: Dict[str, Any], headers: Dict[str, str], metadata: D
         print(f"\nError in call_search_api: {str(e)}")
         raise
 
-def enhance_search_results(results: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Enhance search results with additional metadata.
-    
-    Args:
-        results: The raw search results
-        
-    Returns:
-        Dict containing enhanced search results
-    """
-    # Get documents and totalResults from results
-    documents = results.get("documents", [])
-    total_results = results.get("totalResults", "0")
-    
-    # Create enhanced response
-    enhanced = {
-        "documents": documents,
-        "totalResults": total_results,
-        "metadata": {
-            "total_count": len(documents),
-            "search_fields_used": extract_used_fields(results),
-            "confidence_scores": calculate_confidence_scores(results)
-        }
-    }
-    
-    return enhanced
 
-def extract_used_fields(results: Dict[str, Any]) -> Dict[str, Any]:
-    """Extract fields used in the search results."""
-    used_fields = {}
-    
-    for doc in results.get("documents", []):
-        for field, value in doc.items():
-            if field not in used_fields:
-                used_fields[field] = set()
-            if isinstance(value, list):
-                used_fields[field].update(value)
-            else:
-                used_fields[field].add(value)
-                
-    return {k: list(v) for k, v in used_fields.items()}
-
-def calculate_confidence_scores(results: Dict[str, Any]) -> Dict[str, float]:
-    """Calculate confidence scores for search results."""
-    scores = {}
-    
-    for doc in results.get("documents", []):
-        doc_id = doc.get("id")
-        if doc_id:
-            # Calculate score based on field match quality
-            score = 0.0
-            total_fields = 0
-            
-            for field, value in doc.items():
-                if field not in ["id", "timestamp"]:
-                    total_fields += 1
-                    # Simple scoring based on field presence
-                    score += 1.0
-                    
-            if total_fields > 0:
-                scores[doc_id] = score / total_fields
-                
-    return scores
-
-def format_error_response(error: Exception) -> Dict[str, Any]:
-    """Format error response for API."""
-    return {
-        "error": {
-            "message": str(error),
-            "type": error.__class__.__name__,
-            "timestamp": datetime.now().isoformat()
-        }
-    }
-
-def prepare_filters_for_api(filters: dict) -> dict:
-    """
-    Normalize filter keys for API:
-    - Lowercase first character of each key.
-    - If a value is a list, join all elements into a comma-separated string.
-    - If a value is not a list, use it directly.
-    """
-    api_filters = {}
-    for field, value in filters.items():
-        # Lowercase only the first character of field name
-        api_key = field[0].lower() + field[1:]
-
-        # Determine API value
-        if isinstance(value, list):
-            api_value = ",".join(map(str, value))
-        else:
-            api_value = value
-
-        api_filters[api_key] = api_value
-    return api_filters
 
 def map_search_params(raw_params: dict, metadata: dict) -> dict:
     """

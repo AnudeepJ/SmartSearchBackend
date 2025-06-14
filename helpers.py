@@ -1,56 +1,8 @@
-import re
-from datetime import datetime, timedelta
-from typing import Dict, List, Any, Tuple
-import json
+from typing import Dict, List, Any
 from fuzzywuzzy import fuzz
 from fuzzywuzzy import process
 
-def preprocess_query(query: str) -> str:
-    """Preprocess the query to handle common patterns and edge cases."""
-    # Remove extra whitespace
-    query = " ".join(query.split())
-    
-    # Handle common date patterns
-    query = normalize_date_references(query)
-    
-    # Handle common field name variations
-    query = normalize_field_references(query)
-    
-    return query
 
-def normalize_date_references(query: str) -> str:
-    """Normalize date references in the query."""
-    # Handle "last week", "last month", etc.
-    date_patterns = {
-        r'last week': '7 days ago',
-        r'last month': '30 days ago',
-        r'last year': '365 days ago',
-        r'today': '0 days ago',
-        r'yesterday': '1 day ago'
-    }
-    
-    for pattern, replacement in date_patterns.items():
-        query = re.sub(pattern, replacement, query, flags=re.IGNORECASE)
-    
-    return query
-
-def normalize_field_references(query: str) -> str:
-    """Normalize field name references in the query."""
-    # Common field name variations
-    field_variations = {
-        'doc type': 'Type',
-        'doc status': 'Status',
-        'document type': 'Type',
-        'document status': 'Status',
-        'created date': 'Date Created',
-        'modified date': 'Date Modified',
-        'review date': 'Date Reviewed'
-    }
-    
-    for variation, standard in field_variations.items():
-        query = re.sub(variation, standard, query, flags=re.IGNORECASE)
-    
-    return query
 
 def handle_validation_errors(validation_result: dict, metadata_fields: dict) -> dict:
     """Handle validation errors with detailed feedback."""
@@ -104,53 +56,7 @@ def find_field_metadata(field: str, metadata_fields: dict) -> dict:
             return f
     return None
 
-def enhance_search_results(results: dict) -> dict:
-    """Enhance search results with additional context and metadata."""
-    return {
-        "results": results,
-        "metadata": {
-            "total_count": len(results.get("documents", [])),
-            "search_fields_used": extract_used_fields(results),
-            "confidence_scores": calculate_confidence_scores(results)
-        }
-    }
-
-def extract_used_fields(results: dict) -> List[str]:
-    """Extract fields used in the search."""
-    used_fields = set()
-    for doc in results.get("documents", []):
-        for field in doc.keys():
-            used_fields.add(field)
-    return list(used_fields)
-
-def calculate_confidence_scores(results: dict) -> Dict[str, float]:
-    """Calculate confidence scores for search results."""
-    confidence_scores = {}
-    for doc in results.get("documents", []):
-        # Calculate confidence based on field match quality
-        score = 0.0
-        total_fields = len(doc)
-        if total_fields > 0:
-            # Simple scoring based on field presence
-            score = sum(1 for v in doc.values() if v is not None) / total_fields
-        confidence_scores[doc.get("id", "unknown")] = score
-    return confidence_scores
-
 def get_cached_metadata(headers: dict) -> dict:
     """Get metadata with caching."""
-    # TODO: Implement caching logic
-    from tools import call_metadata
-    return call_metadata(headers)
-
-def call_search_api_with_retry(search_params: dict, headers: dict, max_retries: int = 3) -> dict:
-    """Call search API with retry logic."""
-    from tools import call_search_api
-    import time
-    
-    for attempt in range(max_retries):
-        try:
-            return call_search_api(search_params, headers)
-        except Exception as e:
-            if attempt == max_retries - 1:
-                raise e
-            time.sleep(1 * (attempt + 1))  # Exponential backoff 
+    from tools import get_cached_metadata as tools_get_cached_metadata
+    return tools_get_cached_metadata(headers) 

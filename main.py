@@ -12,15 +12,13 @@ import logging
 from logging.handlers import RotatingFileHandler
 import normalization
 import validation
-from tools import call_metadata, call_search_api, format_error_response
+from SearchPromtUtils import SearchPromptUtils
+from tools import call_search_api
 from helpers import (
-    preprocess_query,
     handle_validation_errors,
-    enhance_search_results,
-    get_cached_metadata,
-    call_search_api_with_retry
+    get_cached_metadata
 )
-from mapping import get_modified_identifier
+from mapping import get_modified_identifier, get_field_id
 
 # Configure logging
 log_dir = "logs"
@@ -134,43 +132,118 @@ SELECT_LIST_8_VALUES = "selectList8Values"
 SELECT_LIST_9_VALUES = "selectList9Values"
 SELECT_LIST_10_VALUES = "selectList10Values"
 
-def get_modified_identifier(identifier: str) -> str:
-    """Map metadata field identifiers to search API field names."""
-    mapping = {
-        VENDOR_DOCUMENT_NUMBER: VENDOR_DOCUMENT_NUMBER_CAMEL_CASE,
-        VENDOR_REV: VENDOR_REV_CAMEL_CASE,
-        CONTRACTOR_DOCUMENT_NUMBER: CONTRACTOR_DOCUMENT_NUMBER_CAMEL_CASE,
-        CONTRACTOR_REV: CONTRACT_REV_CAMEL_CASE,
-        PACKAGE_NUMBER: PACKAGE_NUMBER_VALUES,
-        CONTRACT_NUMBER: CONTRACT_NUMBER_VALUES,
-        DOCUMENT_STATUS: DOC_STATUS_ID_SMALL_CASE,
-        VDR_CODE: VDR_CODE_VALUES,
-        CATEGORY: CATEGORY_VALUES,
-        ATTRIBUTE_1: ATTRIBUTE_1_VALUES,
-        ATTRIBUTE_2: ATTRIBUTE_2_VALUES,
-        ATTRIBUTE_3: ATTRIBUTE_3_VALUES,
-        ATTRIBUTE_4: ATTRIBUTE_4_VALUES,
-        SELECT_LIST_1: SELECT_LIST_1_VALUES,
-        SELECT_LIST_2: SELECT_LIST_2_VALUES,
-        SELECT_LIST_3: SELECT_LIST_3_VALUES,
-        SELECT_LIST_4: SELECT_LIST_4_VALUES,
-        SELECT_LIST_5: SELECT_LIST_5_VALUES,
-        SELECT_LIST_6: SELECT_LIST_6_VALUES,
-        SELECT_LIST_7: SELECT_LIST_7_VALUES,
-        SELECT_LIST_8: SELECT_LIST_8_VALUES,
-        SELECT_LIST_9: SELECT_LIST_9_VALUES,
-        SELECT_LIST_10: SELECT_LIST_10_VALUES
-    }
-    return mapping.get(identifier, identifier)
+
+
+def convert_values_to_ids(value: Any, field_metadata: Dict[str, Any], field_name: str) -> str:
+    """Convert field values to their corresponding IDs."""
+    if isinstance(value, str) and "," in value:
+        # Handle comma-separated values
+        values = [v.strip() for v in value.split(",")]
+        ids = []
+        for val in values:
+            field_id = get_field_id(field_metadata, val)
+            if field_id:
+                ids.append(field_id)
+            else:
+                logger.warning(f"No ID found for value '{val}' in field '{field_name}', keeping original value")
+                ids.append(val)
+        return ",".join(ids)
+    else:
+        # Single value
+        single_value = str(value)
+        field_id = get_field_id(field_metadata, single_value)
+        if field_id:
+            logger.debug(f"Converted '{single_value}' to ID '{field_id}' for field '{field_name}'")
+            return field_id
+        else:
+            logger.warning(f"No ID found for value '{single_value}' in field '{field_name}', keeping original value")
+            return single_value
+
+def format_text_values(value: Any) -> str:
+    """Format values as text (for fields that don't need ID conversion)."""
+    if isinstance(value, list):
+        return ",".join(str(v) for v in value)
+    elif isinstance(value, str) and "," in value:
+        return value  # Already comma-separated
+    else:
+        return str(value)
+
+def transform_parameters_for_api(params: Dict[str, Any], metadata: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Transform validated and normalized parameters for the Aconex Search API.
+    
+    Args:
+        params: The validated and normalized search parameters
+        metadata: The metadata containing field definitions
+        
+    Returns:
+        Dict containing parameters ready for the Aconex Search API
+    """
+    try:
+        # Import the return fields and constants
+        with open("return_fields.json") as f:
+            return_fields = json.load(f)
+        
+        transformed_params = {
+            "returnFields": return_fields,
+            "userId": "1477096489",
+            "orgId": "9146"
+        }
+        
+        for field_name, value in params.items():
+            logger.debug(f"Transforming field: {field_name} = {value}")
+            
+            # Get the correct field name for API using the mapping
+            api_field_name = get_modified_identifier(field_name)
+            logger.debug(f"Mapped to API field: {field_name} -> {api_field_name}")
+            
+            # Find the field in metadata to get correct IDs if needed
+            field_metadata = None
+            for field in metadata.get("searchSchema", {}).get("singleValueFields", []):
+                if field.get("identifier") == field_name:
+                    field_metadata = field
+                    break
+            if not field_metadata:
+                for field in metadata.get("searchSchema", {}).get("multiValueFields", []):
+                    if field.get("identifier") == field_name:
+                        field_metadata = field
+                        break
+            
+            # Handle value transformation - some fields need IDs, others use text values
+            if field_metadata and field_metadata.get("selectValues"):
+                # Fields that typically need ID conversion
+                id_required_fields = {"doctype", "statusid", "status", "documenttype"}
+                
+                if field_name.lower() in id_required_fields:
+                    # Convert values to IDs for these fields
+                    transformed_value = convert_values_to_ids(value, field_metadata, field_name)
+                else:
+                    # Keep text values for other fields (like discipline, category, etc.)
+                    transformed_value = format_text_values(value)
+            else:
+                # No selectValues, use the value as-is
+                transformed_value = format_text_values(value)
+            
+            if transformed_value:  # Only add if we have a valid value
+                transformed_params[api_field_name] = transformed_value
+                logger.debug(f"Added to transformed params: {api_field_name} = {transformed_value}")
+        
+        return transformed_params
+        
+    except Exception as e:
+        logger.error(f"Error transforming parameters: {str(e)}")
+        raise Exception(f"Failed to transform parameters for API: {str(e)}")
 
 def build_preamble(metadata_fields: dict, query: str) -> str:
     """Build the enhanced preamble for the LLM."""
     # Extract only essential field information for searchable fields
     essential_fields = []
-    
+    cleaned = SearchPromptUtils.preprocess_query(query)
+    has_date = SearchPromptUtils.has_date_intent(cleaned)
+    data_fields = []
     # Process single value fields
     for field in metadata_fields.get("searchSchema", {}).get("singleValueFields", []):
-        if field.get("searchable", False):  # Only include searchable fields
+        if field.get("searchable", False) and field.get("dataType") != "DATE":
             field_info = {
                 "fieldName": field.get("fieldName"),
                 "identifier": field.get("identifier"),
@@ -178,10 +251,10 @@ def build_preamble(metadata_fields: dict, query: str) -> str:
                 "selectValues": [v["value"] for v in field.get("selectValues", [])] if field.get("selectValues") else None
             }
             essential_fields.append(field_info)
-    
+
     # Process multi value fields
     for field in metadata_fields.get("searchSchema", {}).get("multiValueFields", []):
-        if field.get("searchable", False):  # Only include searchable fields
+        if field.get("searchable", False) and field.get("dataType") != "DATE":
             field_info = {
                 "fieldName": field.get("fieldName"),
                 "identifier": field.get("identifier"),
@@ -189,6 +262,8 @@ def build_preamble(metadata_fields: dict, query: str) -> str:
                 "selectValues": [v["value"] for v in field.get("selectValues", [])] if field.get("selectValues") else None
             }
             essential_fields.append(field_info)
+    if has_date:
+        data_fields.append( SearchPromptUtils.get_date_fields(metadata_fields))
 
     preamble = f"""
 You are an AI assistant specialized in document search using structured metadata filters. Your task is to map user queries to the correct metadata fields and values.
@@ -199,8 +274,15 @@ Your task is to:
 3. Match user-provided values to the **closest valid options** from the metadata above.
 4. Return a structured **JSON object** with only valid field names and values.
 
+CRITICAL FIELD NAMING RULE:
+- You MUST use the "identifier" field name, NOT the "fieldName" when creating your JSON response.
+- For example: Use "doctype" (identifier), NOT "Type" or "type" (fieldName).
+- Always check the "identifier" value in each field definition below.
+
 Important Instructions:
 - Only use metadata fields and values exactly as listed above.
+- Use ONLY the "identifier" field names in your JSON response (e.g., "doctype", "discipline", "statusid").
+- **BE PRECISE**: When user mentions specific terms (e.g., "2D Model"), return ONLY that exact match. Don't include related terms like "3D Model" unless explicitly requested.
 - If a field is mentioned but the value is vague or partial (e.g., "administration"), choose the **best matching** allowed value.
 - If multiple fields are relevant (e.g., discipline, status, date), include them all.
 - If the user mentions a **person**, map it to appropriate fields such as `"Created By"`, `"Modified By"`, or `"Reviewed By"` — use whichever exists in the metadata.
@@ -210,8 +292,10 @@ Important Instructions:
   - `"fieldname_lte"` for end date
 - If domain-specific keywords appear (e.g., "safety", "signage"), try to match them to the **closest discipline** or category field.
 - If the user provides a general or partial term (e.g., "administration"), and multiple matching values exist (e.g., "AD - Administration", "Administration - HR"), return **all valid matching values** from the metadata
+- **SPECIFICITY RULE**: Only return multiple values if:
+  - User explicitly asks for multiple (e.g., "2D and 3D models")
+  - OR the term is genuinely ambiguous and requires all variants (e.g., "electrical" matching "EL - Electrical", "Electrical", "electrical")
 - Do not guess field names or values — use only what is in the metadata list.
-- Return only one best-matching value per field, unless the query clearly asks for multiple.
 - For multiple values, use comma-separated strings instead of arrays. For example:
   - Correct: {{"discipline": "EL - Electrical,Electrical,electrical"}}
   - Incorrect: {{"discipline": ["EL - Electrical", "Electrical", "electrical"]}}
@@ -221,11 +305,17 @@ Important Instructions:
   - No extra text — **just the JSON**
 
 Example Response Format:
-{{"discipline": "EL - Electrical,Electrical,electrical"}}
+{{"doctype": "2D Model", "discipline": "EL - Electrical,Electrical,electrical"}}
+
+Examples of PRECISION:
+- Query: "search 2D model" → {{"doctype": "2D Model"}} (NOT "2D Model,3D Model")
+- Query: "search 2D and 3D models" → {{"doctype": "2D Model,3D Model"}} (multiple explicitly requested)
+- Query: "electrical documents" → {{"discipline": "EL - Electrical,Electrical,electrical"}} (all electrical variants)
 
 Available Fields (all fields are searchable):
 {json.dumps(essential_fields, indent=2)}
-
+Available date fields
+{json.dumps(data_fields, indent=2)}
 User Query: "{query}"
 """
     logger.debug("\nBuilt Preamble:")
@@ -301,47 +391,6 @@ def search_documents(
         try:
             search_params = json.loads(llm_response)
             logger.debug(f"Raw Search Parameters: {json.dumps(search_params, indent=2)}")
-            #
-            # # Transform the parameters to use correct field names and values
-            # transformed_params = {
-            #     "returnFields": [],
-            #     "userId": "1477096489",
-            #     "orgId": "9146"
-            # }
-            #
-            # for field_name, value in search_params.items():
-            #     # Get the correct field name for API using the mapping
-            #     api_field_name = get_modified_identifier(field_name)
-            #     print(f"Processing field: {field_name} -> {api_field_name}")
-            #
-            #     # Find the field in metadata to get correct IDs
-            #     field_metadata = None
-            #     print(f"Looking for field {field_name} in metadata...")
-            #     print("Available single value fields:", [f.get("identifier") for f in metadata.get("searchSchema", {}).get("singleValueFields", [])])
-            #     print("Available multi value fields:", [f.get("identifier") for f in metadata.get("searchSchema", {}).get("multiValueFields", [])])
-            #
-            #     for field in metadata.get("searchSchema", {}).get("singleValueFields", []):
-            #         if field.get("identifier") == field_name:
-            #             field_metadata = field
-            #             print(f"Found metadata in singleValueFields: {field}")
-            #             break
-            #     if not field_metadata:
-            #         for field in metadata.get("searchSchema", {}).get("multiValueFields", []):
-            #             if field.get("identifier") == field_name:
-            #                 field_metadata = field
-            #                 print(f"Found metadata in multiValueFields: {field}")
-            #                 break
-            #
-            #     # Always add the field to transformed_params, even if metadata is not found
-            #     if isinstance(value, list):
-            #         transformed_params[api_field_name] = ",".join(value)
-            #     else:
-            #         transformed_params[api_field_name] = value
-            #
-            #     print(f"Current transformed_params: {transformed_params}")
-            #
-            # search_params = transformed_params
-            logger.debug(f"Transformed Search Parameters: {json.dumps(search_params, indent=2)}")
             
         except json.JSONDecodeError as e:
             logger.error(f"Error parsing LLM response: {str(e)}")
@@ -354,9 +403,48 @@ def search_documents(
                 }
             )
         
-        # 6. Call search API
-        logger.info("\n6. Calling Search API...")
-        response = call_search_api(search_params, headers, metadata)
+        # 6. Validate LLM response
+        logger.info("\n6. Validating Search Parameters...")
+        validation_result = validation.validate_llm_response(search_params, metadata, verbose=True)
+        
+        if not validation_result["valid"]:
+            logger.warning("Validation failed for search parameters")
+            logger.debug(f"Invalid fields: {validation_result['invalid_fields']}")
+            logger.debug(f"Invalid values: {validation_result['invalid_values']}")
+            
+            # Handle validation errors with suggestions
+            error_details = handle_validation_errors(validation_result, metadata)
+            
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "classification": "validation_error",
+                    "message": "Search parameters failed validation",
+                    "invalid_fields": validation_result["invalid_fields"],
+                    "invalid_values": validation_result["invalid_values"],
+                    "suggestions": error_details.get("suggestions", []),
+                    "closest_matches": error_details.get("closest_matches", {})
+                }
+            )
+        
+        # Use cleaned output from validation
+        search_params = validation_result["cleaned_output"]
+        logger.debug(f"Validated Search Parameters: {json.dumps(search_params, indent=2)}")
+        
+        # 7. Normalize search parameters
+        logger.info("\n7. Normalizing Search Parameters...")
+        normalized_params = normalization.normalize_fields(search_params, metadata, verbose=True)
+        logger.debug(f"Normalized Search Parameters: {json.dumps(normalized_params, indent=2)}")
+        
+        # 8. Transform parameters for API
+        logger.info("\n8. Transforming Parameters for API...")
+        transformed_params = transform_parameters_for_api(normalized_params, metadata)
+        logger.debug(f"Transformed Search Parameters: {json.dumps(transformed_params, indent=2)}")
+        
+        # 9. Call search API
+        logger.info("\n9. Calling Search API...")
+        logger.debug(f"Transformed params for API call: {json.dumps(transformed_params, indent=2)}")
+        response = call_search_api(transformed_params, headers, metadata)
         logger.debug(f"Search Results Summary: {len(response.get('results', {}).get('documents', []))} documents found")
         
         logger.info("\n=== Search Request Completed ===")
@@ -393,7 +481,8 @@ def call_llm(prompt: str, preamble: str) -> str:
         response_text = chat_response.data.chat_response.text
         
         logger.debug(f"\nLLM Response Summary: {len(response_text)} chars")
-        
+        logger.debug(f"\nLLM Response Summary: {response_text} ")
+
         if not response_text:
             logger.warning("Warning: LLM returned empty response")
             return "{}"
@@ -405,40 +494,7 @@ def call_llm(prompt: str, preamble: str) -> str:
         logger.error(f"Error type: {type(e)}")
         raise
 
-def parse_llm_response(llm_response: str) -> dict:
-    """Parse the LLM response into a dictionary of search parameters."""
-    try:
-        if not llm_response:
-            return {}
-            
-        # Try to parse as JSON
-        return json.loads(llm_response)
-    except json.JSONDecodeError as e:
-        print(f"Error parsing LLM response: {str(e)}")
-        return {}
 
-def get_llm_response(preamble: str) -> str:
-    """Get response from LLM with retries."""
-    max_retries = 1
-    retry_count = 0
-    
-    while retry_count < max_retries:
-        try:
-            llm_response = call_llm("", preamble)  # Empty prompt since preamble contains the query
-            if llm_response:  # If we got a non-empty response
-                return llm_response
-            retry_count += 1
-            if retry_count < max_retries:
-                print(f"Empty LLM response, retrying... (Attempt {retry_count + 1}/{max_retries})")
-        except Exception as e:
-            print(f"LLM call failed: {str(e)}")
-            retry_count += 1
-            if retry_count < max_retries:
-                print(f"Retrying... (Attempt {retry_count + 1}/{max_retries})")
-            else:
-                raise
-    
-    return "{}"  # Return empty JSON if all retries fail
 
 if __name__ == "__main__":
     import uvicorn
