@@ -19,6 +19,7 @@ from helpers import (
     get_cached_metadata
 )
 from mapping import get_modified_identifier, get_field_id
+import semantic_mapping
 
 # Configure logging
 log_dir = "logs"
@@ -67,9 +68,12 @@ class SearchResponse(BaseModel):
     applied_filters: Dict[str, Any]  # New field to store applied filters
     message: str = "Search completed successfully"
 
+# Environment Configuration
+from config import config as env_config
+
 # OCI Configuration
 CONFIG_PROFILE = "DEFAULT"
-config = oci.config.from_file('~/.oci/workshop', CONFIG_PROFILE)
+oci_config = oci.config.from_file('~/.oci/workshop', CONFIG_PROFILE)
 
 # Service endpoint and model details
 SERVICE_ENDPOINT = "https://inference.generativeai.us-chicago-1.oci.oraclecloud.com"
@@ -78,7 +82,7 @@ COMPARTMENT_ID = "ocid1.compartment.oc1..aaaaaaaaboqoghc43bbqvei5y4pmnzia36wuh7f
 
 # Initialize Generative AI Client
 llm_client = GenerativeAiInferenceClient(
-    config=config,
+    config=oci_config,
     service_endpoint=SERVICE_ENDPOINT,
     retry_strategy=oci.retry.NoneRetryStrategy(),
     timeout=(10, 240)
@@ -170,7 +174,7 @@ def format_text_values(value: Any) -> str:
 
 def transform_parameters_for_api(params: Dict[str, Any], metadata: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Transform validated and normalized parameters for the Aconex Search API.
+    Transform validated and normalized parameters for the Aconex Search API with date handling.
     
     Args:
         params: The validated and normalized search parameters
@@ -190,10 +194,42 @@ def transform_parameters_for_api(params: Dict[str, Any], metadata: Dict[str, Any
             "orgId": "9146"
         }
         
+        # Get date field identifiers for special handling
+        date_fields = []
+        for field in metadata.get("searchSchema", {}).get("singleValueFields", []) + \
+                   metadata.get("searchSchema", {}).get("multiValueFields", []):
+            if field.get("searchable", False) and field.get("dataType") == "DATE":
+                date_fields.append(field["identifier"])
+        
+        logger.debug(f"Date fields identified: {date_fields}")
+        
         for field_name, value in params.items():
             logger.debug(f"Transforming field: {field_name} = {value}")
             
-            # Get the correct field name for API using the mapping
+            # Handle date field qualifiers and range components directly
+            if field_name.endswith("Qualifier"):
+                base_field = field_name.replace("Qualifier", "")
+                if base_field in date_fields:
+                    # Date qualifiers go directly to API without mapping
+                    transformed_params[field_name] = value
+                    logger.debug(f"Added date qualifier directly: {field_name} = {value}")
+                    continue
+            
+            # Handle date range components (field1, field2)
+            if (field_name.endswith("1") or field_name.endswith("2")) and field_name[:-1] in date_fields:
+                # Date range components go directly to API without mapping
+                transformed_params[field_name] = value
+                logger.debug(f"Added date range component directly: {field_name} = {value}")
+                continue
+            
+            # Check if this is a simple date field
+            if field_name in date_fields:
+                # Simple date fields go directly to API without mapping
+                transformed_params[field_name] = value
+                logger.debug(f"Added date field directly: {field_name} = {value}")
+                continue
+            
+            # Get the correct field name for API using the mapping (for non-date fields)
             api_field_name = get_modified_identifier(field_name)
             logger.debug(f"Mapped to API field: {field_name} -> {api_field_name}")
             
@@ -221,12 +257,18 @@ def transform_parameters_for_api(params: Dict[str, Any], metadata: Dict[str, Any
                     # Keep text values for other fields (like discipline, category, etc.)
                     transformed_value = format_text_values(value)
             else:
-                # No selectValues, use the value as-is
+                # No selectValues, use the value as-is (includes date fields handled above)
                 transformed_value = format_text_values(value)
             
             if transformed_value:  # Only add if we have a valid value
                 transformed_params[api_field_name] = transformed_value
                 logger.debug(f"Added to transformed params: {api_field_name} = {transformed_value}")
+        
+        # Debug: Show final transformed parameters
+        logger.info("Final transformed parameters for API:")
+        for key, value in transformed_params.items():
+            if key not in ["returnFields", "userId", "orgId"]:  # Skip standard fields
+                logger.info(f"  {key}: {value}")
         
         return transformed_params
         
@@ -235,13 +277,172 @@ def transform_parameters_for_api(params: Dict[str, Any], metadata: Dict[str, Any
         raise Exception(f"Failed to transform parameters for API: {str(e)}")
 
 def build_preamble(metadata_fields: dict, query: str) -> str:
-    """Build the enhanced preamble for the LLM."""
-    # Extract only essential field information for searchable fields
+    """Build the enhanced preamble for the LLM with semantic mapping and date handling."""
+    try:
+        # Build semantic mappings from metadata
+        semantic_data = semantic_mapping.build_semantic_mappings(metadata_fields)
+        
+        # Preprocess query and detect intent
+        cleaned = SearchPromptUtils.preprocess_query(query)
+        has_date_intent = SearchPromptUtils.has_date_intent(cleaned)
+        date_concepts = SearchPromptUtils.extract_date_concepts_from_query(cleaned)
+        
+        # Extract essential non-date fields
+        essential_fields = []
+        for field in metadata_fields.get("searchSchema", {}).get("singleValueFields", []):
+            if field.get("searchable", False) and field.get("dataType") != "DATE":
+                field_info = {
+                    "fieldName": field.get("fieldName"),
+                    "identifier": field.get("identifier"),
+                    "dataType": field.get("dataType"),
+                    "selectValues": [v["value"] for v in field.get("selectValues", [])] if field.get("selectValues") else None
+                }
+                essential_fields.append(field_info)
+
+        for field in metadata_fields.get("searchSchema", {}).get("multiValueFields", []):
+            if field.get("searchable", False) and field.get("dataType") != "DATE":
+                field_info = {
+                    "fieldName": field.get("fieldName"),
+                    "identifier": field.get("identifier"),
+                    "dataType": field.get("dataType"),
+                    "selectValues": [v["value"] for v in field.get("selectValues", [])] if field.get("selectValues") else None
+                }
+                essential_fields.append(field_info)
+
+        # Get date fields if needed
+        date_fields = []
+        if has_date_intent:
+            date_fields = SearchPromptUtils.get_date_fields(metadata_fields)
+
+        # Build semantic mapping examples for preamble
+        date_mapping_examples = []
+        date_mappings = semantic_mapping.get_date_field_mappings(semantic_data)
+        if date_mappings:
+            for concept, identifier in list(date_mappings.items())[:5]:  # Show top 5 examples
+                field_name = semantic_data.get('reverse_mappings', {}).get(identifier, identifier)
+                date_mapping_examples.append(f'  - "{concept}" → use "{identifier}" identifier ({field_name} field)')
+
+        # Build preamble with semantic enhancements
+        preamble_parts = []
+        
+        preamble_parts.append("""You are an AI assistant specialized in document search using structured metadata filters. Your task is to map user queries to the correct metadata fields and values.
+
+Your task is to:
+1. Understand the user's query including semantic concepts and date intentions.
+2. Identify relevant metadata fields based on the query using semantic understanding.
+3. Match user-provided values to the **closest valid options** from the metadata.
+4. Handle date expressions and convert them to proper API format.
+5. Return a structured **JSON object** with only valid field names and values.
+
+CRITICAL FIELD NAMING RULE:
+- You MUST use the "identifier" field name, NOT the "fieldName" when creating your JSON response.
+- For example: Use "doctype" (identifier), NOT "Type" or "type" (fieldName).
+- Always check the "identifier" value in each field definition below.""")
+
+        # Add semantic mapping section if we have date concepts
+        if date_mapping_examples:
+            preamble_parts.append(f"""
+SEMANTIC FIELD MAPPINGS:
+When users mention these concepts, use the corresponding identifiers:
+
+📅 DATE CONCEPTS:
+{chr(10).join(date_mapping_examples)}
+
+🔍 USER CONCEPT TRANSLATION:
+- "modified/updated/changed documents" → use "registered" identifier (Date Modified field)
+- "created/new/added documents" → use appropriate creation date identifier  
+- "approved/authorized documents" → use appropriate approval date identifier""")
+
+        # Add date format section if dates detected
+        if has_date_intent:
+            preamble_parts.append(f"""
+📅 DATE FIELD FORMAT REQUIREMENTS:
+
+**CRITICAL: Different qualifiers use different date formats!**
+
+1. **BEFORE/AFTER/ON qualifiers**: Use simple YYYY-MM-DD format
+   - Before: {{"registered1": "2025-06-13", "registeredQualifier": "BEFORE"}}
+   - After: {{"registered1": "2025-06-14", "registeredQualifier": "AFTER"}}
+   - On: {{"registered": "2025-06-14"}}
+
+2. **BETWEEN qualifiers**: Use full ISO format with time
+   - Range: {{
+       "registered1": "2025-06-13T05:30:00.000Z",
+       "registered2": "2025-06-16T05:30:00.000Z", 
+       "registeredQualifier": "BETWEEN"
+     }}
+
+DATE FORMAT RULES:
+- BEFORE/AFTER/ON: Simple YYYY-MM-DD format only
+- BETWEEN: Full ISO format YYYY-MM-DDTHH:mm:ss.sssZ with 05:30:00.000 time
+- BEFORE/AFTER: Only use field1, never field2
+- BETWEEN: Use both field1 and field2
+- ON: Use simple field structure (no range components)
+- Valid qualifiers: "BETWEEN", "ON", "BEFORE", "AFTER"
+
+SEMANTIC DATE EXAMPLES:
+- "documents before June 13" → {{"registered1": "2025-06-13", "registeredQualifier": "BEFORE"}}
+- "documents after June 14" → {{"registered1": "2025-06-14", "registeredQualifier": "AFTER"}}
+- "documents updated last week" → {{"registered1": "2025-06-07T05:30:00.000Z", "registered2": "2025-06-14T05:30:00.000Z", "registeredQualifier": "BETWEEN"}}
+- "modified documents today" → {{"registered": "2025-06-14"}}""")
+
+        # Add core instructions
+        preamble_parts.append("""
+Important Instructions:
+- Only use metadata fields and values exactly as listed below.
+- Use ONLY the "identifier" field names in your JSON response (e.g., "doctype", "discipline", "statusid").
+- **BE PRECISE**: When user mentions specific terms (e.g., "2D Model"), return ONLY that exact match. Don't include related terms like "3D Model" unless explicitly requested.
+- **SPECIFICITY RULE**: Only return multiple values if:
+  - User explicitly asks for multiple (e.g., "2D and 3D models")
+  - OR the term is genuinely ambiguous and requires all variants (e.g., "electrical" matching "EL - Electrical", "Electrical", "electrical")
+- For multiple values, use comma-separated strings instead of arrays.
+- If domain-specific keywords appear (e.g., "safety", "signage"), try to match them to the **closest discipline** or category field.
+- The response must be a clean, valid JSON object with no comments, markdown, or extra text.""")
+
+        # Add example formats
+        preamble_parts.append(f"""
+Example Response Formats:
+- Basic: {{"doctype": "2D Model", "discipline": "EL - Electrical,Electrical,electrical"}}
+- With dates: {{"doctype": "2D Model", "registered1": "2025-06-07T05:30:00.000Z", "registered2": "2025-06-14T05:30:00.000Z", "registeredQualifier": "BETWEEN"}}
+
+PRECISION EXAMPLES:
+- Query: "search 2D model" → {{"doctype": "2D Model"}} (NOT "2D Model,3D Model")
+- Query: "electrical documents modified today" → {{"discipline": "EL - Electrical,Electrical,electrical", "registered": "2025-06-14T05:30:00.000Z"}}""")
+
+        # Add available fields
+        preamble_parts.append(f"""
+Available Fields (all fields are searchable):
+{json.dumps(essential_fields, indent=2)}""")
+
+        # Add date fields if relevant
+        if date_fields:
+            preamble_parts.append(f"""
+Available Date Fields:
+{json.dumps(date_fields, indent=2)}""")
+
+        # Add user query
+        preamble_parts.append(f"""
+User Query: "{query}\"""")
+
+        # Join all parts
+        preamble = "\n".join(preamble_parts)
+        
+        logger.debug("\nBuilt Enhanced Preamble with Semantic Mapping")
+        logger.debug(f"Date intent detected: {has_date_intent}")
+        logger.debug(f"Date concepts found: {date_concepts}")
+        logger.debug(f"Semantic mappings available: {len(date_mappings)} date mappings")
+        
+        return preamble
+        
+    except Exception as e:
+        logger.error(f"Error building enhanced preamble: {str(e)}")
+        # Fallback to basic preamble if semantic enhancement fails
+        return build_basic_preamble(metadata_fields, query)
+
+def build_basic_preamble(metadata_fields: dict, query: str) -> str:
+    """Fallback basic preamble builder if semantic enhancement fails."""
+    # This is essentially the old build_preamble function as a fallback
     essential_fields = []
-    cleaned = SearchPromptUtils.preprocess_query(query)
-    has_date = SearchPromptUtils.has_date_intent(cleaned)
-    data_fields = []
-    # Process single value fields
     for field in metadata_fields.get("searchSchema", {}).get("singleValueFields", []):
         if field.get("searchable", False) and field.get("dataType") != "DATE":
             field_info = {
@@ -252,7 +453,6 @@ def build_preamble(metadata_fields: dict, query: str) -> str:
             }
             essential_fields.append(field_info)
 
-    # Process multi value fields
     for field in metadata_fields.get("searchSchema", {}).get("multiValueFields", []):
         if field.get("searchable", False) and field.get("dataType") != "DATE":
             field_info = {
@@ -262,65 +462,27 @@ def build_preamble(metadata_fields: dict, query: str) -> str:
                 "selectValues": [v["value"] for v in field.get("selectValues", [])] if field.get("selectValues") else None
             }
             essential_fields.append(field_info)
-    if has_date:
-        data_fields.append( SearchPromptUtils.get_date_fields(metadata_fields))
 
-    preamble = f"""
-You are an AI assistant specialized in document search using structured metadata filters. Your task is to map user queries to the correct metadata fields and values.
-
-Your task is to:
-1. Understand the user's query.
-2. Identify relevant metadata fields based on the query.
-3. Match user-provided values to the **closest valid options** from the metadata above.
-4. Return a structured **JSON object** with only valid field names and values.
+    return f"""
+You are an AI assistant specialized in document search using structured metadata filters.
 
 CRITICAL FIELD NAMING RULE:
 - You MUST use the "identifier" field name, NOT the "fieldName" when creating your JSON response.
-- For example: Use "doctype" (identifier), NOT "Type" or "type" (fieldName).
-- Always check the "identifier" value in each field definition below.
 
-Important Instructions:
-- Only use metadata fields and values exactly as listed above.
-- Use ONLY the "identifier" field names in your JSON response (e.g., "doctype", "discipline", "statusid").
-- **BE PRECISE**: When user mentions specific terms (e.g., "2D Model"), return ONLY that exact match. Don't include related terms like "3D Model" unless explicitly requested.
-- If a field is mentioned but the value is vague or partial (e.g., "administration"), choose the **best matching** allowed value.
-- If multiple fields are relevant (e.g., discipline, status, date), include them all.
-- If the user mentions a **person**, map it to appropriate fields such as `"Created By"`, `"Modified By"`, or `"Reviewed By"` — use whichever exists in the metadata.
-- If a **year or date** is mentioned, return it using the appropriate date field (e.g., `"Date Created"`, `"Date Reviewed"`).
-- For date ranges, use:
-  - `"fieldname_gte"` for start date
-  - `"fieldname_lte"` for end date
-- If domain-specific keywords appear (e.g., "safety", "signage"), try to match them to the **closest discipline** or category field.
-- If the user provides a general or partial term (e.g., "administration"), and multiple matching values exist (e.g., "AD - Administration", "Administration - HR"), return **all valid matching values** from the metadata
-- **SPECIFICITY RULE**: Only return multiple values if:
-  - User explicitly asks for multiple (e.g., "2D and 3D models")
-  - OR the term is genuinely ambiguous and requires all variants (e.g., "electrical" matching "EL - Electrical", "Electrical", "electrical")
-- Do not guess field names or values — use only what is in the metadata list.
-- For multiple values, use comma-separated strings instead of arrays. For example:
-  - Correct: {{"discipline": "EL - Electrical,Electrical,electrical"}}
-  - Incorrect: {{"discipline": ["EL - Electrical", "Electrical", "electrical"]}}
-- The response must be a clean, valid JSON object:
-  - No comments
-  - No markdown
-  - No extra text — **just the JSON**
-
-Example Response Format:
-{{"doctype": "2D Model", "discipline": "EL - Electrical,Electrical,electrical"}}
-
-Examples of PRECISION:
-- Query: "search 2D model" → {{"doctype": "2D Model"}} (NOT "2D Model,3D Model")
-- Query: "search 2D and 3D models" → {{"doctype": "2D Model,3D Model"}} (multiple explicitly requested)
-- Query: "electrical documents" → {{"discipline": "EL - Electrical,Electrical,electrical"}} (all electrical variants)
-
-Available Fields (all fields are searchable):
+Available Fields:
 {json.dumps(essential_fields, indent=2)}
-Available date fields
-{json.dumps(data_fields, indent=2)}
+
 User Query: "{query}"
 """
-    logger.debug("\nBuilt Preamble:")
-    logger.debug(preamble)
-    return preamble
+
+@app.get("/environment")
+def get_environment_info():
+    """Get information about the current environment configuration."""
+    return {
+        "status": "success",
+        "environment": env_config.get_environment_info(),
+        "available_environments": env_config.list_environments()
+    }
 
 @app.post("/search", response_model=dict, responses={422: {"model": ClarificationResponse}})
 def search_documents(
@@ -433,7 +595,7 @@ def search_documents(
         
         # 7. Normalize search parameters
         logger.info("\n7. Normalizing Search Parameters...")
-        normalized_params = normalization.normalize_fields(search_params, metadata, verbose=True)
+        normalized_params = normalization.normalize_fields(search_params, metadata, query=processed_query, verbose=True)
         logger.debug(f"Normalized Search Parameters: {json.dumps(normalized_params, indent=2)}")
         
         # 8. Transform parameters for API

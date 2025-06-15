@@ -4,6 +4,9 @@ import requests
 import time
 from datetime import datetime
 from mapping import get_modified_identifier
+import semantic_mapping
+import re
+from config import config
 
 # Constants
 with open("return_fields.json") as f:
@@ -11,9 +14,9 @@ with open("return_fields.json") as f:
     USER_ID = "1477096489"
     ORG_ID = "9146"
 
-# API Endpoints
-METADATA_API_URL = "https://au1.aconex.com/mobile/rest/projects/26851/metadata/documents"
-SEARCH_API_URL = "https://au1.aconex.com/mobile/rest/projects/26851/documents/search/filter?content_search=false&sort_direction=DESC&page_number=1&sort=registered"
+# API Endpoints - Now dynamically loaded from environment config
+METADATA_API_URL = config.get_metadata_url()
+SEARCH_API_URL = config.get_search_url()
 
 # Cache configuration
 CACHE_TTL = 300  # 5 minutes in seconds
@@ -146,23 +149,251 @@ def convert_ids_to_display_values(ids: List[str], field_metadata: Dict[str, Any]
     
     return result
 
+def format_date_for_ui(date_value: str) -> str:
+    """
+    Format API date value for UI display.
+    
+    Args:
+        date_value: Date in API format (YYYY-MM-DDTHH:mm:ss.sssZ)
+        
+    Returns:
+        Human-readable date string
+    """
+    try:
+        # Parse API format
+        if re.match(r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$', date_value):
+            parsed_date = datetime.strptime(date_value, "%Y-%m-%dT%H:%M:%S.%fZ")
+            # Format for UI display
+            return parsed_date.strftime("%B %d, %Y")  # e.g., "June 14, 2025"
+        
+        # If already in simple format
+        elif re.match(r'^\d{4}-\d{2}-\d{2}$', date_value):
+            parsed_date = datetime.strptime(date_value, "%Y-%m-%d")
+            return parsed_date.strftime("%B %d, %Y")
+        
+        # Return as-is if can't parse
+        return date_value
+        
+    except Exception:
+        return date_value
+
+def prepare_date_filter_for_ui(field_name: str, params: Dict[str, Any], field_metadata: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Prepare date field filter for UI display.
+    Handles both simple dates and date ranges.
+    
+    Args:
+        field_name: Base field name (e.g., "registered")
+        params: All search parameters
+        field_metadata: Field metadata for the date field
+        
+    Returns:
+        Date filter object with proper UI formatting
+    """
+    # Check for range structure
+    field1_key = f"{field_name}1"
+    field2_key = f"{field_name}2"
+    qualifier_key = f"{field_name}Qualifier"
+    
+    has_range = field1_key in params or field2_key in params or qualifier_key in params
+    has_simple = field_name in params
+    
+    if has_range:
+        # Date range structure
+        start_date = params.get(field1_key, "")
+        end_date = params.get(field2_key, "")
+        qualifier = params.get(qualifier_key, "BETWEEN")
+        
+        # Format dates for display
+        display_start = format_date_for_ui(start_date) if start_date else ""
+        display_end = format_date_for_ui(end_date) if end_date else ""
+        
+        # Create range description and compatibility values based on qualifier
+        if qualifier == "BETWEEN" and display_start and display_end:
+            range_display = f"{display_start} to {display_end}"
+            compatibility_value = f"{start_date},{end_date}"
+            full_id = f"{start_date},{end_date},{qualifier}"
+        elif qualifier == "BEFORE" and display_start:
+            range_display = f"Before {display_start}"
+            compatibility_value = start_date  # Only start date for BEFORE
+            full_id = f"{start_date},{qualifier}"
+        elif qualifier == "AFTER" and display_start:
+            range_display = f"After {display_start}"
+            compatibility_value = start_date  # Only start date for AFTER  
+            full_id = f"{start_date},{qualifier}"
+        else:
+            range_display = f"{display_start} ({qualifier.lower()})"
+            compatibility_value = start_date
+            full_id = f"{start_date},{qualifier}"
+        
+        applied_filters = {
+            field_name: [compatibility_value],          # Optimized for compatibility
+            f"{field_name}_display": [range_display],   # Human-readable range
+            f"{field_name}_full": [{
+                "id": full_id,
+                "display": range_display,
+                "type": "date_range",
+                "start_date": start_date,
+                "end_date": end_date if qualifier == "BETWEEN" else None,
+                "qualifier": qualifier,
+                "start_display": display_start,
+                "end_display": display_end if qualifier == "BETWEEN" else None
+            }]
+        }
+        
+    elif has_simple:
+        # Simple date structure
+        date_value = params[field_name]
+        display_value = format_date_for_ui(date_value)
+        
+        applied_filters = {
+            field_name: [date_value],                   # Original value
+            f"{field_name}_display": [display_value],   # Human-readable
+            f"{field_name}_full": [{
+                "id": date_value,
+                "display": display_value,
+                "type": "date_single"
+            }]
+        }
+    else:
+        applied_filters = {
+            field_name: [],
+            f"{field_name}_display": [],
+            f"{field_name}_full": []
+        }
+    
+    return {
+        "applied_filters": applied_filters,
+        "filter": {
+            "fieldName": field_metadata.get("fieldName"),
+            "identifier": field_name,
+            "dataType": "DATE",
+            "sortable": field_metadata.get("sortable", False),
+            "searchable": field_metadata.get("searchable", True),
+            "modifiedFieldName": field_metadata.get("fieldName"),
+            "typeIdentifier": field_metadata.get("typeIdentifier", 0),
+            "selectValues": [],  # Date fields don't have selectValues
+            "dateField": True,   # Flag for UI to handle differently
+            "supportedQualifiers": ["BETWEEN", "ON", "BEFORE", "AFTER", "GTE", "LTE"]
+        }
+    }
+
+def get_date_field_names(metadata: Dict[str, Any]) -> List[str]:
+    """Get list of date field identifiers from metadata."""
+    date_fields = []
+    
+    # Process single value fields
+    for field in metadata.get("searchSchema", {}).get("singleValueFields", []):
+        if field.get("searchable", False) and field.get("dataType") == "DATE":
+            date_fields.append(field["identifier"])
+    
+    # Process multi value fields  
+    for field in metadata.get("searchSchema", {}).get("multiValueFields", []):
+        if field.get("searchable", False) and field.get("dataType") == "DATE":
+            date_fields.append(field["identifier"])
+    
+    return date_fields
+
 def prepare_filters_for_ui(search_params: Dict[str, Any], metadata: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
-    Prepare filter objects for UI before API call.
+    Prepare filter objects for UI before API call with enhanced date handling.
     This ensures we have the correct field names and metadata before any transformations.
-    Includes both ID values and human-readable display values.
+    Includes both ID values, human-readable display values, and special date field handling.
     """
     print("\n=== Debug: Preparing Filters for UI ===")
     print("Search params:", {k: v for k, v in search_params.items() if k not in ["returnFields", "userId", "orgId"]})
     
     filters = []
+    date_fields = get_date_field_names(metadata)
+    processed_fields = set()  # Track processed fields to avoid duplicates
+    
+    print(f"Date fields identified: {date_fields}")
+    
     for field_name, values in search_params.items():
         # Skip non-search fields
         if field_name in ["returnFields", "userId", "orgId"]:
             continue
             
-        print(f"\nProcessing field: {field_name}")
+        # Skip if already processed (for date range components)
+        if field_name in processed_fields:
+            continue
             
+        print(f"\nProcessing field: {field_name}")
+        
+        # Check if this is a date range component (field1, field2, fieldQualifier)
+        is_date_component = False
+        base_field = None
+        
+        if field_name.endswith("1") or field_name.endswith("2"):
+            potential_base = field_name[:-1]
+            if potential_base in date_fields:
+                is_date_component = True
+                base_field = potential_base
+        elif field_name.endswith("Qualifier"):
+            potential_base = field_name.replace("Qualifier", "")
+            if potential_base in date_fields:
+                is_date_component = True
+                base_field = potential_base
+        
+        # If this is a date component, process the entire date structure
+        if is_date_component:
+            if base_field not in processed_fields:
+                print(f"Processing date field structure for: {base_field}")
+                
+                # Find metadata for the base date field
+                base_field_metadata = None
+                for field in metadata.get("searchSchema", {}).get("singleValueFields", []):
+                    if field.get("identifier") == base_field:
+                        base_field_metadata = field
+                        break
+                if not base_field_metadata:
+                    for field in metadata.get("searchSchema", {}).get("multiValueFields", []):
+                        if field.get("identifier") == base_field:
+                            base_field_metadata = field
+                            break
+                
+                if base_field_metadata:
+                    date_filter = prepare_date_filter_for_ui(base_field, search_params, base_field_metadata)
+                    filters.append(date_filter)
+                    
+                    # Mark all related fields as processed
+                    processed_fields.add(base_field)
+                    processed_fields.add(f"{base_field}1")
+                    processed_fields.add(f"{base_field}2") 
+                    processed_fields.add(f"{base_field}Qualifier")
+                    
+                    print(f"Added date filter for {base_field}")
+                    print(f"  - Display: {date_filter['applied_filters'].get(f'{base_field}_display', [])}")
+            continue
+        
+        # Check if this is a simple date field
+        if field_name in date_fields:
+            print(f"Processing simple date field: {field_name}")
+            
+            # Find metadata for the date field
+            field_metadata = None
+            for field in metadata.get("searchSchema", {}).get("singleValueFields", []):
+                if field.get("identifier") == field_name:
+                    field_metadata = field
+                    break
+            if not field_metadata:
+                for field in metadata.get("searchSchema", {}).get("multiValueFields", []):
+                    if field.get("identifier") == field_name:
+                        field_metadata = field
+                        break
+            
+            if field_metadata:
+                date_filter = prepare_date_filter_for_ui(field_name, search_params, field_metadata)
+                filters.append(date_filter)
+                processed_fields.add(field_name)
+                
+                print(f"Added simple date filter for {field_name}")
+                print(f"  - Display: {date_filter['applied_filters'].get(f'{field_name}_display', [])}")
+            continue
+        
+        # Handle non-date fields (existing logic)
+        print(f"Processing non-date field: {field_name}")
+        
         # Find the field metadata
         field_metadata = None
         for field in metadata.get("searchSchema", {}).get("singleValueFields", []):
@@ -208,6 +439,8 @@ def prepare_filters_for_ui(search_params: Dict[str, Any], metadata: Dict[str, An
                 }
             }
             filters.append(filter_obj)
+            processed_fields.add(field_name)
+            
             print(f"Added filter for {field_name}")
             print(f"  - IDs: {[val['id'] for val in applied_values]}")
             print(f"  - Display: {[val['display'] for val in applied_values]}")
