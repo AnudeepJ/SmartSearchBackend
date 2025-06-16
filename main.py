@@ -6,7 +6,7 @@ from oci.generative_ai_inference import GenerativeAiInferenceClient
 from oci.generative_ai_inference.models import CohereChatRequest, ChatDetails, OnDemandServingMode
 import os
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 import time
 import logging
 from logging.handlers import RotatingFileHandler
@@ -20,6 +20,7 @@ from helpers import (
 )
 from mapping import get_modified_identifier, get_field_id
 import semantic_mapping
+import re
 
 # Configure logging
 log_dir = "logs"
@@ -80,12 +81,12 @@ SERVICE_ENDPOINT = "https://inference.generativeai.us-chicago-1.oci.oraclecloud.
 LLM_MODEL = "cohere.command-r-plus-08-2024"
 COMPARTMENT_ID = "ocid1.compartment.oc1..aaaaaaaaboqoghc43bbqvei5y4pmnzia36wuh7fpcxn6fia7pfyelyg4rj7a"
 
-# Initialize Generative AI Client
+# Initialize Generative AI Client with intelligent retry strategy
 llm_client = GenerativeAiInferenceClient(
     config=oci_config,
     service_endpoint=SERVICE_ENDPOINT,
-    retry_strategy=oci.retry.NoneRetryStrategy(),
-    timeout=(10, 240)
+    retry_strategy=oci.retry.DEFAULT_RETRY_STRATEGY,  # Enable automatic retries
+    timeout=(10, 60)  # Reduced to 60 seconds
 )
 
 # Constants for field identifiers
@@ -276,16 +277,72 @@ def transform_parameters_for_api(params: Dict[str, Any], metadata: Dict[str, Any
         logger.error(f"Error transforming parameters: {str(e)}")
         raise Exception(f"Failed to transform parameters for API: {str(e)}")
 
+def preprocess_query_with_dates(query: str) -> str:
+    """
+    Preprocess query to convert relative dates (today, yesterday, tomorrow) to actual dates.
+    This ensures the LLM receives concrete dates instead of relative terms.
+    
+    Args:
+        query: Original user query
+        
+    Returns:
+        Query with relative dates converted to actual dates
+    """
+    try:
+        # Get current date
+        current_date = datetime.now()
+        current_date_str = current_date.strftime("%Y-%m-%d")
+        yesterday_str = (current_date - timedelta(days=1)).strftime("%Y-%m-%d")
+        tomorrow_str = (current_date + timedelta(days=1)).strftime("%Y-%m-%d")
+        
+        # Create processed query
+        processed_query = query.lower()
+        
+        # Convert relative dates to actual dates (comprehensive list)
+        replacements = [
+            ('today', current_date_str),
+            ('tdy', current_date_str),
+            ('now', current_date_str),
+            ('this day', current_date_str),
+            ('yesterday', yesterday_str),
+            ('yest', yesterday_str),
+            ('tomorrow', tomorrow_str),
+            ('tmr', tomorrow_str),
+            ('tom', tomorrow_str)
+        ]
+        
+        for relative_term, actual_date in replacements:
+            if relative_term in processed_query:
+                # Replace the term but preserve the case context of the original query
+                original_index = query.lower().find(relative_term)
+                if original_index != -1:
+                    # Preserve original capitalization pattern
+                    query = query[:original_index] + actual_date + query[original_index + len(relative_term):]
+                    logger.info(f"Converted '{relative_term}' to '{actual_date}' in query")
+        
+        return query
+        
+    except Exception as e:
+        logger.warning(f"Error preprocessing dates in query: {str(e)}")
+        return query  # Return original query if preprocessing fails
+
 def build_preamble(metadata_fields: dict, query: str) -> str:
     """Build the enhanced preamble for the LLM with semantic mapping and date handling."""
     try:
         # Build semantic mappings from metadata
         semantic_data = semantic_mapping.build_semantic_mappings(metadata_fields)
         
-        # Preprocess query and detect intent
+        # Preprocess query and detect intent (use the processed query, not original)
         cleaned = SearchPromptUtils.preprocess_query(query)
         has_date_intent = SearchPromptUtils.has_date_intent(cleaned)
         date_concepts = SearchPromptUtils.extract_date_concepts_from_query(cleaned)
+        
+        # Re-check date intent after preprocessing if not detected initially
+        if not has_date_intent and ('modified' in query.lower() or 'updated' in query.lower() or 'created' in query.lower()):
+            # Check if query now contains actual dates after preprocessing
+            if re.search(r'\d{4}-\d{2}-\d{2}', query):
+                has_date_intent = True
+                logger.debug("Date intent detected after preprocessing due to actual date in query")
         
         # Extract essential non-date fields
         essential_fields = []
@@ -325,104 +382,53 @@ def build_preamble(metadata_fields: dict, query: str) -> str:
         # Build preamble with semantic enhancements
         preamble_parts = []
         
-        preamble_parts.append("""You are an AI assistant specialized in document search using structured metadata filters. Your task is to map user queries to the correct metadata fields and values.
+        preamble_parts.append(f"""You are an AI assistant specialized in document search using structured metadata filters. 
 
-Your task is to:
-1. Understand the user's query including semantic concepts and date intentions.
-2. Identify relevant metadata fields based on the query using semantic understanding.
-3. Match user-provided values to the **closest valid options** from the metadata.
-4. Handle date expressions and convert them to proper API format.
-5. Return a structured **JSON object** with only valid field names and values.
+📅 TODAY'S DATE: {datetime.now().strftime('%Y-%m-%d')}
 
-CRITICAL FIELD NAMING RULE:
-- You MUST use the "identifier" field name, NOT the "fieldName" when creating your JSON response.
-- For example: Use "doctype" (identifier), NOT "Type" or "type" (fieldName).
-- Always check the "identifier" value in each field definition below.""")
+CRITICAL: Return ONLY a simple JSON object with field identifiers and values.
 
-        # Add semantic mapping section if we have date concepts
+EXAMPLES:
+- "fetch 2D models" → {{"doctype": "2D Model"}}
+- "electrical documents" → {{"discipline": "EL - Electrical"}}
+- "documents modified today" → {{"registered1": "{datetime.now().strftime('%Y-%m-%d')}", "registeredQualifier": "ON"}}
+- "documents on specific date" → {{"registered": "YYYY-MM-DD"}}
+
+RULES:
+- Use field "identifier" names from metadata (e.g., "doctype", "discipline", "registered")
+- NO null values, NO extra structure, NO operators
+- For "modified/updated" queries: use registered1 + registeredQualifier
+- For "on specific date" queries: use registered only
+- Match values to available options in metadata""")
+
+        # Add simplified date mapping if needed
         if date_mapping_examples:
             preamble_parts.append(f"""
-SEMANTIC FIELD MAPPINGS:
-When users mention these concepts, use the corresponding identifiers:
+DATE FIELDS:
+{chr(10).join(date_mapping_examples[:3])}  
 
-📅 DATE CONCEPTS:
-{chr(10).join(date_mapping_examples)}
+DATE RULES:
+- "modified today" = {{"registered1": "{datetime.now().strftime('%Y-%m-%d')}", "registeredQualifier": "ON"}}
+- "on specific date" = {{"registered": "YYYY-MM-DD"}}""")
 
-🔍 USER CONCEPT TRANSLATION:
-- "modified/updated/changed documents" → use "registered" identifier (Date Modified field)
-- "created/new/added documents" → use appropriate creation date identifier  
-- "approved/authorized documents" → use appropriate approval date identifier""")
 
-        # Add date format section if dates detected
-        if has_date_intent:
-            preamble_parts.append(f"""
-📅 DATE FIELD FORMAT REQUIREMENTS:
 
-**CRITICAL: Different qualifiers use different date formats!**
 
-1. **BEFORE/AFTER/ON qualifiers**: Use simple YYYY-MM-DD format
-   - Before: {{"registered1": "2025-06-13", "registeredQualifier": "BEFORE"}}
-   - After: {{"registered1": "2025-06-14", "registeredQualifier": "AFTER"}}
-   - On: {{"registered": "2025-06-14"}}
 
-2. **BETWEEN qualifiers**: Use full ISO format with time
-   - Range: {{
-       "registered1": "2025-06-13T05:30:00.000Z",
-       "registered2": "2025-06-16T05:30:00.000Z", 
-       "registeredQualifier": "BETWEEN"
-     }}
 
-DATE FORMAT RULES:
-- BEFORE/AFTER/ON: Simple YYYY-MM-DD format only
-- BETWEEN: Full ISO format YYYY-MM-DDTHH:mm:ss.sssZ with 05:30:00.000 time
-- BEFORE/AFTER: Only use field1, never field2
-- BETWEEN: Use both field1 and field2
-- ON: Use simple field structure (no range components)
-- Valid qualifiers: "BETWEEN", "ON", "BEFORE", "AFTER"
 
-SEMANTIC DATE EXAMPLES:
-- "documents before June 13" → {{"registered1": "2025-06-13", "registeredQualifier": "BEFORE"}}
-- "documents after June 14" → {{"registered1": "2025-06-14", "registeredQualifier": "AFTER"}}
-- "documents updated last week" → {{"registered1": "2025-06-07T05:30:00.000Z", "registered2": "2025-06-14T05:30:00.000Z", "registeredQualifier": "BETWEEN"}}
-- "modified documents today" → {{"registered": "2025-06-14"}}""")
-
-        # Add core instructions
-        preamble_parts.append("""
-Important Instructions:
-- Only use metadata fields and values exactly as listed below.
-- Use ONLY the "identifier" field names in your JSON response (e.g., "doctype", "discipline", "statusid").
-- **BE PRECISE**: When user mentions specific terms (e.g., "2D Model"), return ONLY that exact match. Don't include related terms like "3D Model" unless explicitly requested.
-- **SPECIFICITY RULE**: Only return multiple values if:
-  - User explicitly asks for multiple (e.g., "2D and 3D models")
-  - OR the term is genuinely ambiguous and requires all variants (e.g., "electrical" matching "EL - Electrical", "Electrical", "electrical")
-- For multiple values, use comma-separated strings instead of arrays.
-- If domain-specific keywords appear (e.g., "safety", "signage"), try to match them to the **closest discipline** or category field.
-- The response must be a clean, valid JSON object with no comments, markdown, or extra text.""")
-
-        # Add example formats
+        # Add essential fields only
         preamble_parts.append(f"""
-Example Response Formats:
-- Basic: {{"doctype": "2D Model", "discipline": "EL - Electrical,Electrical,electrical"}}
-- With dates: {{"doctype": "2D Model", "registered1": "2025-06-07T05:30:00.000Z", "registered2": "2025-06-14T05:30:00.000Z", "registeredQualifier": "BETWEEN"}}
+Available Fields:
+{json.dumps(essential_fields[:10], indent=2)}""")
 
-PRECISION EXAMPLES:
-- Query: "search 2D model" → {{"doctype": "2D Model"}} (NOT "2D Model,3D Model")
-- Query: "electrical documents modified today" → {{"discipline": "EL - Electrical,Electrical,electrical", "registered": "2025-06-14T05:30:00.000Z"}}""")
 
-        # Add available fields
-        preamble_parts.append(f"""
-Available Fields (all fields are searchable):
-{json.dumps(essential_fields, indent=2)}""")
-
-        # Add date fields if relevant
-        if date_fields:
-            preamble_parts.append(f"""
-Available Date Fields:
-{json.dumps(date_fields, indent=2)}""")
 
         # Add user query
         preamble_parts.append(f"""
-User Query: "{query}\"""")
+User Query: "{query}"
+
+Return ONLY JSON, no explanation.""")
 
         # Join all parts
         preamble = "\n".join(preamble_parts)
@@ -516,9 +522,10 @@ def search_documents(
         logger.debug("\nMetadata Summary:")
         logger.debug(f"Total fields: {len(metadata.get('searchSchema', {}).get('singleValueFields', [])) + len(metadata.get('searchSchema', {}).get('multiValueFields', []))}")
         
-        # 2. Preprocess query
+        # 2. Preprocess query with date handling
         logger.info("\n2. Preprocessing Query...")
-        processed_query = req.query.strip()
+        processed_query = preprocess_query_with_dates(req.query.strip())
+        logger.info(f"Original Query: {req.query}")
         logger.info(f"Processed Query: {processed_query}")
         
         # 3. Build preamble
@@ -526,9 +533,9 @@ def search_documents(
         preamble = build_preamble(metadata, processed_query)
         logger.info("Preamble built successfully")
         
-        # 4. Call LLM with retries
+        # 4. Call LLM with improved retry logic
         logger.info("\n4. Calling LLM...")
-        max_retries = 1
+        max_retries = 3
         retry_count = 0
         llm_response = {}
         
@@ -540,13 +547,35 @@ def search_documents(
                 retry_count += 1
                 if retry_count < max_retries:
                     logger.warning(f"Empty LLM response, retrying... (Attempt {retry_count + 1}/{max_retries})")
+                    time.sleep(2 ** retry_count)  # Exponential backoff: 2s, 4s, 8s
             except Exception as e:
-                logger.error(f"LLM call failed: {str(e)}")
+                error_str = str(e)
+                logger.error(f"LLM call failed: {error_str}")
+                
+                # Check if this is a timeout or service error
+                is_timeout = "ReadTimeoutError" in error_str or "timeout" in error_str.lower()
+                is_service_error = "500" in error_str or "503" in error_str or "502" in error_str
+                
                 retry_count += 1
-                if retry_count < max_retries:
-                    logger.warning(f"Retrying... (Attempt {retry_count + 1}/{max_retries})")
+                if retry_count < max_retries and (is_timeout or is_service_error):
+                    wait_time = 2 ** retry_count  # Exponential backoff
+                    logger.warning(f"Retrying after {wait_time}s... (Attempt {retry_count + 1}/{max_retries})")
+                    logger.warning(f"Retry reason: {'Timeout' if is_timeout else 'Service error'}")
+                    time.sleep(wait_time)
                 else:
-                    raise
+                    # Don't retry for other types of errors, or if max retries reached
+                    if retry_count >= max_retries:
+                        logger.error("Max retries reached - Oracle Cloud LLM service may be overloaded")
+                        raise HTTPException(
+                            status_code=503,
+                            detail={
+                                "message": "LLM service temporarily unavailable",
+                                "error": "Oracle Cloud service timeout/overload",
+                                "retry_after": "Please try again in a few minutes"
+                            }
+                        )
+                    else:
+                        raise
         
         # 5. Parse LLM response
         logger.info("\n5. Parsing LLM Response...")
@@ -630,7 +659,7 @@ def call_llm(prompt: str, preamble: str) -> str:
         llm_chat_request.preamble_override = preamble
         llm_chat_request.message = prompt
         llm_chat_request.is_stream = False
-        llm_chat_request.max_tokens = 500
+        llm_chat_request.max_tokens = 200  # Reduced for faster response
         llm_chat_request.is_force_single_step = True
 
         chat_detail = ChatDetails()
