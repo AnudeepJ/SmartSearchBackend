@@ -366,20 +366,53 @@ def transform_parameters_for_api(params: Dict[str, Any], metadata: Dict[str, Any
                         field_metadata = field
                         break
             
-            # Handle value transformation - some fields need IDs, others use text values
-            if field_metadata and field_metadata.get("selectValues"):
-                # Fields that typically need ID conversion
-                id_required_fields = {"doctype", "statusid", "status", "documenttype"}
-                
-                if field_name.lower() in id_required_fields:
-                    # Convert values to IDs for these fields
-                    transformed_value = convert_values_to_ids(value, field_metadata, field_name)
+            # Special handling: certain API fields must be arrays (e.g., vdrCodeValues)
+            array_expected_fields = {
+                VDR_CODE_VALUES,
+                CATEGORY_VALUES,
+                ATTRIBUTE_1_VALUES,
+                ATTRIBUTE_2_VALUES,
+                ATTRIBUTE_3_VALUES,
+                ATTRIBUTE_4_VALUES,
+                SELECT_LIST_1_VALUES,
+                SELECT_LIST_2_VALUES,
+                SELECT_LIST_3_VALUES,
+                SELECT_LIST_4_VALUES,
+                SELECT_LIST_5_VALUES,
+                SELECT_LIST_6_VALUES,
+                SELECT_LIST_7_VALUES,
+                SELECT_LIST_8_VALUES,
+                SELECT_LIST_9_VALUES,
+                SELECT_LIST_10_VALUES,
+            }
+
+            if api_field_name in array_expected_fields:
+                # Coerce to array
+                if isinstance(value, list):
+                    transformed_value = [str(v).strip() for v in value if v is not None]
+                elif isinstance(value, str):
+                    parts = [p.strip() for p in value.split(",")] if "," in value else [value.strip()]
+                    transformed_value = [p for p in parts if p]
                 else:
-                    # Keep text values for other fields (like discipline, category, etc.)
-                    transformed_value = format_text_values(value)
+                    transformed_value = [str(value)]
             else:
-                # No selectValues, use the value as-is (includes date fields handled above)
-                transformed_value = format_text_values(value)
+                # Handle value transformation - some fields need IDs, others use text values
+                if field_metadata and field_metadata.get("selectValues"):
+                    # Fields that typically need ID conversion
+                    id_required_fields = {"doctype", "statusid", "status", "documenttype"}
+                    
+                    if field_name.lower() in id_required_fields:
+                        # Ensure list inputs are converted to comma-separated before ID mapping
+                        if isinstance(value, list):
+                            value = ",".join(str(v) for v in value)
+                        # Convert values to IDs for these fields
+                        transformed_value = convert_values_to_ids(value, field_metadata, field_name)
+                    else:
+                        # Keep text values for other fields (like discipline, category, etc.)
+                        transformed_value = format_text_values(value)
+                else:
+                    # No selectValues, use the value as-is (includes date fields handled above)
+                    transformed_value = format_text_values(value)
             
             if transformed_value:  # Only add if we have a valid value
                 transformed_params[api_field_name] = transformed_value
@@ -537,7 +570,8 @@ DATE QUALIFIER AND FORMAT RULES:
 
 OUTPUT FORMAT RULES:
 - Use only metadata identifier names (e.g., "doctype", "discipline", "registered").
-- No arrays; for multiple values use a single comma-separated string.
+- For fields ending with "Values" (e.g., vdrCodeValues, categoryValues, attribute1Values...), return arrays of strings.
+- For other fields, use a single string; if multiple are needed, use a comma-separated string.
 - Return multiple values only if explicitly requested or genuinely ambiguous.
 - Return just the JSON object: no comments, markdown, or extra text.
 
