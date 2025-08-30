@@ -139,6 +139,123 @@ SELECT_LIST_10_VALUES = "selectList10Values"
 
 
 
+RELATIVE_DATE_QUALIFIERS = {
+    "TODAY",
+    "TOMORROW",
+    "YESTERDAY",
+    "LAST7DAYS",
+    "LAST30DAYS",
+    "LAST90DAYS",
+    "NEXT7DAYS",
+    "NEXT30DAYS",
+    "NEXT90DAYS",
+}
+
+def _to_date_only_str(value: Any) -> str:
+    try:
+        s = str(value).strip()
+        if "T" in s:
+            return s.split("T", 1)[0]
+        return s
+    except Exception:
+        return str(value)
+
+def _to_between_iso_str(value: Any) -> str:
+    try:
+        s = str(value).strip()
+        if "T" in s:
+            return s
+        # Append standard time per API expectation
+        return f"{s}T05:30:00.000Z"
+    except Exception:
+        return str(value)
+
+def normalize_date_field_components(
+    params: Dict[str, Any],
+    date_identifiers: set
+) -> Dict[str, Any]:
+    """Normalize date field inputs to consistent API components.
+
+    Rules applied:
+    - If a base date field (e.g., "registered", "revisionDate") is present with a qualifier:
+      - For ON: keep base field as is (e.g., registered = YYYY-MM-DD)
+      - For BEFORE/AFTER: move the date to base+"1" and set qualifier
+      - For BETWEEN: ensure base+"1" and base+"2" exist; leave qualifier as BETWEEN
+    - If base+"1"/base+"2"/base+"Qualifier" are already present, leave as-is.
+    - Applies only to identifiers found in date_identifiers.
+    """
+    try:
+        updated = dict(params)
+        # Find base date fields present in params
+        candidate_bases = set()
+        for key in list(updated.keys()):
+            if key in date_identifiers:
+                candidate_bases.add(key)
+            elif (key.endswith("1") or key.endswith("2")) and key[:-1] in date_identifiers:
+                candidate_bases.add(key[:-1])
+            elif key.endswith("Qualifier") and key[:-9] in date_identifiers:
+                candidate_bases.add(key[:-9])
+
+        for base in candidate_bases:
+            qualifier_key = f"{base}Qualifier"
+            range_start_key = f"{base}1"
+            range_end_key = f"{base}2"
+
+            qualifier = updated.get(qualifier_key)
+            base_value_present = base in updated
+            has_start = range_start_key in updated
+            has_end = range_end_key in updated
+
+            if qualifier:
+                q_upper = str(qualifier).upper()
+                if q_upper in RELATIVE_DATE_QUALIFIERS:
+                    # Relative windows: send only the qualifier, no dates
+                    if base_value_present:
+                        del updated[base]
+                    if has_start:
+                        del updated[range_start_key]
+                    if has_end:
+                        del updated[range_end_key]
+                elif q_upper == "ON":
+                    # Use base1 with YYYY-MM-DD; remove base and base2
+                    if base_value_present and not has_start:
+                        updated[range_start_key] = _to_date_only_str(updated[base])
+                        del updated[base]
+                    if has_start:
+                        updated[range_start_key] = _to_date_only_str(updated[range_start_key])
+                    if has_end:
+                        del updated[range_end_key]
+                elif q_upper in ("BEFORE", "AFTER"):
+                    # Use base1 with YYYY-MM-DD; remove base and base2
+                    if base_value_present and not has_start:
+                        updated[range_start_key] = _to_date_only_str(updated[base])
+                        del updated[base]
+                    if has_start:
+                        updated[range_start_key] = _to_date_only_str(updated[range_start_key])
+                    if has_end:
+                        del updated[range_end_key]
+                elif q_upper == "BETWEEN":
+                    # Use base1/base2 in ISO with T05:30:00.000Z; remove base
+                    if base_value_present:
+                        if not has_start:
+                            updated[range_start_key] = updated[base]
+                        if not has_end:
+                            updated[range_end_key] = updated[base]
+                        del updated[base]
+                    updated[range_start_key] = _to_between_iso_str(updated.get(range_start_key))
+                    updated[range_end_key] = _to_between_iso_str(updated.get(range_end_key))
+                else:
+                    # Unknown qualifier: leave structure untouched
+                    pass
+            else:
+                # No qualifier; if we have base+1/base+2 only, leave; else leave base as-is
+                pass
+
+        return updated
+    except Exception as e:
+        logger.warning(f"normalize_date_field_components failed: {str(e)}")
+        return params
+
 def convert_values_to_ids(value: Any, field_metadata: Dict[str, Any], field_name: str) -> str:
     """Convert field values to their corresponding IDs."""
     if isinstance(value, str) and "," in value:
@@ -203,6 +320,9 @@ def transform_parameters_for_api(params: Dict[str, Any], metadata: Dict[str, Any
                 date_fields.append(field["identifier"])
         
         logger.debug(f"Date fields identified: {date_fields}")
+        
+        # Normalize date field components (e.g., revisionDate + Qualifier → revisionDate1 + Qualifier)
+        params = normalize_date_field_components(params, set(date_fields))
         
         for field_name, value in params.items():
             logger.debug(f"Transforming field: {field_name} = {value}")
@@ -391,8 +511,8 @@ CRITICAL: Return ONLY a simple JSON object with field identifiers and values.
 EXAMPLES:
 - "fetch 2D models" → {{"doctype": "2D Model"}}
 - "electrical documents" → {{"discipline": "EL - Electrical"}}
-- "documents modified today" → {{"registered1": "{datetime.now().strftime('%Y-%m-%d')}", "registeredQualifier": "ON"}}
-- "documents on specific date" → {{"registered": "YYYY-MM-DD"}}
+- "documents modified today" → {{"registeredQualifier": "TODAY"}}
+- "documents on specific date" → {{"registeredQualifier": "ON", "registered1": "YYYY-MM-DD"}}
 
 RULES:
 - Use field "identifier" names from metadata (e.g., "doctype", "discipline", "registered")
@@ -400,6 +520,35 @@ RULES:
 - For "modified/updated" queries: use registered1 + registeredQualifier
 - For "on specific date" queries: use registered only
 - Match values to available options in metadata""")
+
+        # Add concept translation and detailed date qualifier/format rules
+        preamble_parts.append(f"""
+CONCEPT TRANSLATION:
+- "modified"/"updated"/"changed" → use "registered" identifier (Date Modified field)
+- "created"/"new" → use appropriate creation date identifier
+- "approved"/"authorized" → use appropriate approval date identifier
+
+DATE QUALIFIER AND FORMAT RULES:
+- ON specific date: {{"<dateId>Qualifier": "ON", "<dateId>1": "YYYY-MM-DD"}}
+- BEFORE: {{"<dateId>Qualifier": "BEFORE", "<dateId>1": "YYYY-MM-DD"}}
+- AFTER: {{"<dateId>Qualifier": "AFTER", "<dateId>1": "YYYY-MM-DD"}}
+- BETWEEN: {{"<dateId>Qualifier": "BETWEEN", "<dateId>1": "YYYY-MM-DDT05:30:00.000Z", "<dateId>2": "YYYY-MM-DDT05:30:00.000Z"}}
+- RELATIVE WINDOWS (no dates): TODAY, TOMORROW, YESTERDAY, LAST7DAYS, LAST30DAYS, LAST90DAYS, NEXT7DAYS, NEXT30DAYS, NEXT90DAYS
+
+OUTPUT FORMAT RULES:
+- Use only metadata identifier names (e.g., "doctype", "discipline", "registered").
+- No arrays; for multiple values use a single comma-separated string.
+- Return multiple values only if explicitly requested or genuinely ambiguous.
+- Return just the JSON object: no comments, markdown, or extra text.
+
+EXAMPLE RESPONSE FORMATS:
+- Basic: {{"doctype": "2D Model", "discipline": "EL - Electrical,Electrical,electrical"}}
+- Date ON: {{"revisiondateQualifier": "ON", "revisiondate1": "2025-08-27"}}
+- Date BEFORE: {{"revisiondateQualifier": "BEFORE", "revisiondate1": "2025-08-30"}}
+- Date AFTER: {{"revisiondateQualifier": "AFTER", "revisiondate1": "2025-08-25"}}
+- Date BETWEEN: {{"revisiondateQualifier": "BETWEEN", "revisiondate1": "2025-08-27T05:30:00.000Z", "revisiondate2": "2025-08-30T05:30:00.000Z"}}
+- Date RELATIVE: {{"revisiondateQualifier": "LAST7DAYS"}}
+""")
 
         # Add simplified date mapping if needed
         if date_mapping_examples:
@@ -421,6 +570,12 @@ DATE RULES:
         preamble_parts.append(f"""
 Available Fields:
 {json.dumps(essential_fields[:10], indent=2)}""")
+
+        # Add available date fields if relevant
+        if date_fields:
+            preamble_parts.append(f"""
+Available Date Fields:
+{json.dumps(date_fields, indent=2)}""")
 
 
 
