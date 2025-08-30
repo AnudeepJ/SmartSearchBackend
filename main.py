@@ -7,6 +7,7 @@ from oci.generative_ai_inference.models import CohereChatRequest, ChatDetails, O
 import os
 import json
 from datetime import datetime, timedelta
+import ast
 import time
 import logging
 from logging.handlers import RotatingFileHandler
@@ -387,12 +388,30 @@ def transform_parameters_for_api(params: Dict[str, Any], metadata: Dict[str, Any
             }
 
             if api_field_name in array_expected_fields:
-                # Coerce to array
+                # Coerce to array robustly (handle list, comma-strings, and bracketed list strings)
+                transformed_value = []
                 if isinstance(value, list):
                     transformed_value = [str(v).strip() for v in value if v is not None]
                 elif isinstance(value, str):
-                    parts = [p.strip() for p in value.split(",")] if "," in value else [value.strip()]
-                    transformed_value = [p for p in parts if p]
+                    s = value.strip()
+                    if s.startswith("[") and s.endswith("]"):
+                        parsed = None
+                        try:
+                            # Try JSON first
+                            parsed = json.loads(s)
+                        except Exception:
+                            try:
+                                # Fallback to Python literal (e.g., "['x','y']")
+                                parsed = ast.literal_eval(s)
+                            except Exception:
+                                parsed = None
+                        if isinstance(parsed, list):
+                            transformed_value = [str(v).strip() for v in parsed if v is not None]
+                        else:
+                            transformed_value = [s]
+                    else:
+                        parts = [p.strip() for p in s.split(",")] if "," in s else [s]
+                        transformed_value = [p for p in parts if p]
                 else:
                     transformed_value = [str(value)]
             else:
