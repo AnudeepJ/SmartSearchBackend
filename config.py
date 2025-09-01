@@ -17,16 +17,16 @@ class EnvironmentConfig:
         },
         "TEST": {
             "name": "Test Environment", 
-            "metadata_url": "https://test.aconex.com/mobile/rest/projects/26851/metadata/documents",
-            "search_url": "https://test.aconex.com/mobile/rest/projects/26851/documents/search/filter?content_search=false&sort_direction=DESC&page_number=1&sort=registered",
-            "project_id": "26851",
+            "metadata_url": "https://ocipl12.aconex.oraclecloud.com/mobile/rest/projects/1879053290/metadata/documents",
+            "search_url": "https://ocipl12.aconex.oraclecloud.com/mobile/rest/projects/1879053290/documents/search/filter?content_search=false&sort_direction=DESC&page_number=1&sort=registered",
+            "project_id": "1879053290",
             "description": "Test environment - requires VPN connection"
         }
     }
     
     def __init__(self):
         # Get environment from env variable or default to AU1
-        self.current_env = os.getenv("ACONEX_ENV", "AU1").upper()
+        self.current_env = os.getenv("ACONEX_ENV", "TEST").upper()
         
         # Validate environment
         if self.current_env not in self.ENVIRONMENTS:

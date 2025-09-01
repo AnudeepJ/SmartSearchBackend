@@ -11,15 +11,15 @@ from config import config
 # Constants
 with open("return_fields.json") as f:
     RETURN_FIELDS = json.load(f)
-    USER_ID = "1477096489"
-    ORG_ID = "9146"
+    USER_ID = "1879053256"
+    ORG_ID = "1"
 
 # API Endpoints - Now dynamically loaded from environment config
 METADATA_API_URL = config.get_metadata_url()
 SEARCH_API_URL = config.get_search_url()
 
 # Cache configuration
-CACHE_TTL = 300  # 5 minutes in seconds
+CACHE_TTL = 900  # 5 minutes in seconds
 metadata_cache = {
     "data": None,
     "timestamp": None
@@ -69,7 +69,7 @@ def call_metadata(headers: Dict[str, str]) -> Dict[str, Any]:
         response = requests.get(
             METADATA_API_URL,
             headers=headers,
-            timeout=10
+            timeout=60
         )
         response.raise_for_status()
         return response.json()
@@ -516,12 +516,12 @@ def call_search_api(params: Dict[str, Any], headers: Dict[str, str], metadata: D
         print(f"Processed params: {processed_params}")
         # Create request body with all required fields
         request_body = {
-            **processed_params,  # Include processed search parameters
+            **params,  # Include processed search parameters
             "returnFields": RETURN_FIELDS,
             "userId": USER_ID,
             "orgId": ORG_ID
         }
-        
+        print(f"Request url: {SEARCH_API_URL}")
         response = requests.post(
             SEARCH_API_URL,
             headers=headers,

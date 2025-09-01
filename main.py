@@ -309,8 +309,8 @@ def transform_parameters_for_api(params: Dict[str, Any], metadata: Dict[str, Any
         
         transformed_params = {
             "returnFields": return_fields,
-            "userId": "1477096489",
-            "orgId": "9146"
+            "userId": "1879053256",
+            "orgId": "1"
         }
         
         # Get date field identifiers for special handling
@@ -607,7 +607,7 @@ EXAMPLE RESPONSE FORMATS:
         if date_mapping_examples:
             preamble_parts.append(f"""
 DATE FIELDS:
-{chr(10).join(date_mapping_examples[:3])}  
+{chr(10).join(date_mapping_examples)}  
 
 DATE RULES:
 - "modified today" = {{"registered1": "{datetime.now().strftime('%Y-%m-%d')}", "registeredQualifier": "ON"}}
@@ -622,7 +622,7 @@ DATE RULES:
         # Add essential fields only
         preamble_parts.append(f"""
 Available Fields:
-{json.dumps(essential_fields[:10], indent=2)}""")
+{json.dumps(essential_fields, indent=2)}""")
 
         # Add available date fields if relevant
         if date_fields:
